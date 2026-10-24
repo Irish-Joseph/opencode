@@ -874,7 +874,9 @@ describe("Anthropic Messages route", () => {
         "deepseek",
         "custom",
       ]) {
-        const selected = AnthropicMessages.route.with({ provider }).model({ id: "video-model" })
+        const selected = AnthropicMessages.route
+          .with({ provider, endpoint: { baseURL: "https://proxy.example/v1" } })
+          .model({ id: "video-model" })
         const input = LLM.request({
           model: selected,
           messages: [
@@ -922,18 +924,25 @@ describe("Anthropic Messages route", () => {
         ])
         expect(body.messages).toHaveLength(4)
       }
-      for (const [family, host, supported] of [
-        ["minimax", "proxy.example", true],
-        ["moonshot", "proxy.example", true],
-        ["meta", "proxy.example", true],
-        ["anthropic", "api.minimax.io", true],
-        ["anthropic", "api.moonshot.ai", true],
-        ["anthropic", "api.meta.ai", true],
-        ["anthropic", "api.meta.ai.example.com", false],
+      for (const [family, host, expected] of [
+        ["minimax", "proxy.example", "minimax"],
+        ["moonshot", "proxy.example", "moonshot"],
+        ["meta", "proxy.example", "meta"],
+        ["anthropic", "api.minimax.io", "minimax"],
+        ["anthropic", "api.minimax.cn", "minimax"],
+        ["anthropic", "api.moonshot.ai", "moonshot"],
+        ["anthropic", "api.meta.ai", "meta"],
+        ["minimax", "api.meta.ai", "meta"],
+        ["meta", "api.moonshot.ai", "moonshot"],
+        ["meta", "api.anthropic.com", undefined],
+        ["minimax", "api.openai.com", undefined],
+        ["moonshot", "api.deepseek.com", undefined],
+        ["meta", "api.x.ai", undefined],
+        ["anthropic", "api.meta.ai.example.com", undefined],
       ] as const) {
         const selected = AnthropicMessages.route
           .with({
-            provider: "custom",
+            provider: host === "proxy.example" ? "custom" : family,
             providerMetadataKey: family,
             endpoint: { baseURL: `https://${host}/v1` },
           })
@@ -943,11 +952,39 @@ describe("Anthropic Messages route", () => {
           prompt: Message.media(Media.base64("AAECAw==", "video/mp4")),
           cache: "none",
         })
-        if (!supported) {
+        if (expected === undefined) {
           yield* compileRequest(input).pipe(Effect.flip)
           continue
         }
         expect((yield* compileRequest(input)).body.messages[0]?.content).toEqual([video])
+        const tool = yield* compileRequest(
+          LLMRequest.update(input, {
+            messages: [
+              Message.assistant([ToolCallPart.make({ id: "video", name: "read", input: {} })]),
+              Message.tool({
+                id: "video",
+                name: "read",
+                resultType: "content",
+                result: [{ type: "file", mime: "video/mp4", uri: "data:video/mp4;base64,AAECAw==" }],
+              }),
+            ],
+          }),
+        )
+        expect(tool.body.messages[1]?.content).toEqual([
+          { type: "tool_result", tool_use_id: "video", content: expected === "meta" ? [] : [video] },
+          ...(expected === "meta" ? [video] : []),
+        ])
+        if (host === "proxy.example") continue
+        const remote = LLMRequest.update(input, {
+          messages: [Message.user([Message.media(Media.url("mm_file://clip", { mediaType: "video/mp4" }))])],
+        })
+        if (expected === "minimax") {
+          expect((yield* compileRequest(remote)).body.messages[0]?.content).toEqual([
+            { type: "video", source: { type: "url", url: "mm_file://clip" } },
+          ])
+          continue
+        }
+        yield* compileRequest(remote).pipe(Effect.flip)
       }
       for (const [provider, asset, source] of [
         ["minimax", Media.ref("minimax", "mm_file://clip", "video/mp4"), { type: "url", url: "mm_file://clip" }],
@@ -962,7 +999,9 @@ describe("Anthropic Messages route", () => {
         ["meta", Media.ref("minimax", "mm_file://clip", "video/mp4"), undefined],
       ] as const) {
         const input = LLM.request({
-          model: AnthropicMessages.route.with({ provider }).model({ id: "video-model" }),
+          model: AnthropicMessages.route
+            .with({ provider, endpoint: { baseURL: "https://proxy.example/v1" } })
+            .model({ id: "video-model" }),
           prompt: Message.media(asset),
           cache: "none",
         })

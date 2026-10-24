@@ -687,26 +687,23 @@ const citationsFromMetadata = (metadata: MediaPart["metadata"]): AnthropicDocume
 const isHttpUrl = (value: string) => /^https?:\/\//i.test(value.trim())
 
 const videoProvider = (request: LLMRequest) => {
-  const provider = request.model.provider.toLowerCase()
-  const family = request.model.route.providerMetadataKey
   const host = URL.parse(request.model.route.endpoint.baseURL ?? "")?.hostname
-  if (
-    ["minimax", "minimax-cn", "minimax-coding-plan", "minimax-cn-coding-plan"].includes(provider) ||
-    family === "minimax" ||
-    host === "api.minimax.io" ||
-    host === "api.minimaxi.com"
-  )
-    return "minimax"
-  if (
-    ["moonshotai", "moonshotai-cn", "moonshot", "kimi", "kimi-for-coding"].includes(provider) ||
-    family === "moonshot" ||
-    host === "api.moonshot.ai" ||
-    host === "api.moonshot.cn" ||
-    host === "api.kimi.ai" ||
-    host === "api.kimi.com"
-  )
-    return "moonshot"
-  if (provider === "meta" || family === "meta" || host === "api.meta.ai") return "meta"
+  if (["api.anthropic.com", "api.openai.com", "api.deepseek.com", "api.x.ai"].includes(host ?? "")) return undefined
+  if (["api.minimax.io", "api.minimax.cn", "api.minimaxi.com"].includes(host ?? "")) return "minimax"
+  if (["api.moonshot.ai", "api.moonshot.cn", "api.kimi.ai", "api.kimi.com"].includes(host ?? "")) return "moonshot"
+  if (host === "api.meta.ai") return "meta"
+  for (const identity of [
+    request.model.route.providerMetadataKey,
+    request.model.route.provider,
+    request.model.provider,
+  ]) {
+    const provider = identity?.toLowerCase()
+    if (["minimax", "minimax-cn", "minimax-coding-plan", "minimax-cn-coding-plan"].includes(provider ?? ""))
+      return "minimax"
+    if (["moonshotai", "moonshotai-cn", "moonshot", "kimi", "kimi-for-coding"].includes(provider ?? ""))
+      return "moonshot"
+    if (provider === "meta") return "meta"
+  }
   return undefined
 }
 
