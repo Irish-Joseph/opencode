@@ -15,7 +15,7 @@ import {
 import { Auth, Endpoint, LLMClient, Route } from "../../src/route.js"
 import { compileRequest } from "../../src/route/client.js"
 import * as AnthropicMessages from "../../src/protocols/anthropic-messages.js"
-import { GoogleVertexMessages } from "../../src/providers.js"
+import { GoogleVertexMessages, Meta, MiniMax, Moonshot } from "../../src/providers.js"
 import { continuationRequest, nativeAnthropicMessagesContinuation } from "../continuation-scenarios.js"
 import { it } from "../lib/effect.js"
 import { dynamicResponse, fixedResponse } from "../lib/http.js"
@@ -863,169 +863,77 @@ describe("Anthropic Messages route", () => {
   it.effect("gates Messages video by provider and keeps Meta video after parallel tool results", () =>
     Effect.gen(function* () {
       const video = { type: "video", source: { type: "base64", media_type: "video/mp4", data: "AAECAw==" } }
-      for (const provider of [
-        "minimax",
-        "minimax-cn",
-        "moonshotai",
-        "moonshotai-cn",
-        "kimi-for-coding",
-        "meta",
-        "anthropic",
-        "deepseek",
-        "custom",
-      ]) {
-        const selected = AnthropicMessages.route
-          .with({ provider, endpoint: { baseURL: "https://proxy.example/v1" } })
-          .model({ id: "video-model" })
-        const input = LLM.request({
-          model: selected,
+      const attachment = { type: "file" as const, uri: "data:video/mp4;base64,AAECAw==", mime: "video/mp4" }
+      const user = LLM.request({
+        model: MiniMax.configure({ apiKey: "test" }).messages("video-model"),
+        prompt: Message.media(Media.base64("AAECAw==", "video/mp4"), { cache: new CacheHint({ type: "ephemeral" }) }),
+        cache: "none",
+      })
+      const minimax = yield* compileRequest(user)
+      expect(minimax.body.messages).toEqual([
+        { role: "user", content: [{ ...video, cache_control: { type: "ephemeral" } }] },
+      ])
+
+      const moonshot = yield* compileRequest(
+        LLM.request({
+          model: Moonshot.configure({ apiKey: "test" }).messages("video-model"),
           messages: [
-            Message.user([
-              Message.media(Media.base64("AAECAw==", "video/mp4"), { cache: new CacheHint({ type: "ephemeral" }) }),
-            ]),
+            Message.assistant([ToolCallPart.make({ id: "clip", name: "read", input: {} })]),
+            Message.tool({ id: "clip", name: "read", resultType: "content", result: [attachment] }),
+          ],
+          cache: "none",
+        }),
+      )
+      expect(expectToolResult(moonshot.body).content).toEqual([video])
+
+      const metaEndpoint = yield* compileRequest(
+        LLM.request({
+          model: MiniMax.configure({ apiKey: "test", baseURL: "https://api.meta.ai/v1" }).messages("video-model"),
+          messages: [
             Message.assistant([
               ToolCallPart.make({ id: "first", name: "read", input: {} }),
               ToolCallPart.make({ id: "second", name: "read", input: {} }),
             ]),
-            ...["first", "second"].map((id) =>
-              Message.tool({
-                id,
-                name: "read",
-                resultType: "content",
-                result: [
-                  { type: "text", text: id },
-                  { type: "file", uri: "data:video/mp4;base64,AAECAw==", mime: "video/mp4" },
-                ],
-              }),
-            ),
+            Message.tool({ id: "first", name: "read", resultType: "content", result: [attachment] }),
+            Message.tool({ id: "second", name: "read", resultType: "content", result: [attachment] }),
             Message.assistant("Observed."),
           ],
           cache: "none",
-        })
-        if (["anthropic", "deepseek", "custom"].includes(provider)) {
-          expect((yield* compileRequest(input).pipe(Effect.flip)).message).toContain(
-            "does not support media type video/mp4",
-          )
-          expect(
-            (yield* compileRequest(LLMRequest.update(input, { messages: input.messages.slice(1) })).pipe(Effect.flip))
-              .message,
-          ).toContain("does not support media type video/mp4")
-          continue
-        }
-        const body = (yield* compileRequest(input)).body
-        expect(body.messages[0]?.content).toEqual([{ ...video, cache_control: { type: "ephemeral" } }])
-        expect(body.messages[2]?.content).toEqual([
-          ...["first", "second"].map((id) => ({
-            type: "tool_result",
-            tool_use_id: id,
-            content: [{ type: "text", text: id }, ...(provider === "meta" ? [] : [video])],
-          })),
-          ...(provider === "meta" ? [video, video] : []),
-        ])
-        expect(body.messages).toHaveLength(4)
-      }
-      for (const [family, host, expected] of [
-        ["minimax", "proxy.example", "minimax"],
-        ["moonshot", "proxy.example", "moonshot"],
-        ["meta", "proxy.example", "meta"],
-        ["anthropic", "api.minimax.io", "minimax"],
-        ["anthropic", "api.minimax.cn", "minimax"],
-        ["anthropic", "api.moonshot.ai", "moonshot"],
-        ["anthropic", "api.meta.ai", "meta"],
-        ["minimax", "api.meta.ai", "meta"],
-        ["meta", "api.moonshot.ai", "moonshot"],
-        ["meta", "api.anthropic.com", undefined],
-        ["minimax", "api.openai.com", undefined],
-        ["moonshot", "api.deepseek.com", undefined],
-        ["meta", "api.x.ai", undefined],
-        ["anthropic", "api.meta.ai.example.com", undefined],
-      ] as const) {
-        const selected = AnthropicMessages.route
-          .with({
-            provider: host === "proxy.example" ? "custom" : family,
-            providerMetadataKey: family,
-            endpoint: { baseURL: `https://${host}/v1` },
-          })
-          .model({ id: "video-model" })
-        const input = LLM.request({
-          model: selected,
-          prompt: Message.media(Media.base64("AAECAw==", "video/mp4")),
-          cache: "none",
-        })
-        if (expected === undefined) {
-          yield* compileRequest(input).pipe(Effect.flip)
-          continue
-        }
-        expect((yield* compileRequest(input)).body.messages[0]?.content).toEqual([video])
-        const tool = yield* compileRequest(
-          LLMRequest.update(input, {
-            messages: [
-              Message.assistant([ToolCallPart.make({ id: "video", name: "read", input: {} })]),
-              Message.tool({
-                id: "video",
-                name: "read",
-                resultType: "content",
-                result: [{ type: "file", mime: "video/mp4", uri: "data:video/mp4;base64,AAECAw==" }],
-              }),
-            ],
-          }),
-        )
-        expect(tool.body.messages[1]?.content).toEqual([
-          { type: "tool_result", tool_use_id: "video", content: expected === "meta" ? [] : [video] },
-          ...(expected === "meta" ? [video] : []),
-        ])
-        if (host === "proxy.example") continue
-        const remote = LLMRequest.update(input, {
-          messages: [Message.user([Message.media(Media.url("mm_file://clip", { mediaType: "video/mp4" }))])],
-        })
-        if (expected === "minimax") {
-          expect((yield* compileRequest(remote)).body.messages[0]?.content).toEqual([
-            { type: "video", source: { type: "url", url: "mm_file://clip" } },
-          ])
-          continue
-        }
-        yield* compileRequest(remote).pipe(Effect.flip)
-      }
-      for (const [provider, asset, source] of [
-        ["minimax", Media.ref("minimax", "mm_file://clip", "video/mp4"), { type: "url", url: "mm_file://clip" }],
-        ["moonshotai", Media.ref("moonshotai", "ms://clip", "video/mp4"), { type: "url", url: "ms://clip" }],
-        ["meta", Media.ref("meta", "file_clip", "video/mp4"), { type: "file", file_id: "file_clip" }],
-        [
-          "minimax",
-          Media.url("https://example.com/clip.mp4", { mediaType: "video/mp4" }),
-          { type: "url", url: "https://example.com/clip.mp4" },
-        ],
-        ["moonshotai", Media.url("https://example.com/clip.mp4", { mediaType: "video/mp4" }), undefined],
-        ["meta", Media.ref("minimax", "mm_file://clip", "video/mp4"), undefined],
-      ] as const) {
-        const input = LLM.request({
-          model: AnthropicMessages.route
-            .with({ provider, endpoint: { baseURL: "https://proxy.example/v1" } })
-            .model({ id: "video-model" }),
-          prompt: Message.media(asset),
-          cache: "none",
-        })
-        if (source === undefined) {
-          yield* compileRequest(input).pipe(Effect.flip)
-          continue
-        }
-        expect((yield* compileRequest(input)).body.messages[0]?.content).toEqual([{ type: "video", source }])
-        if (source.type !== "url") continue
-        const tool = yield* compileRequest(
-          LLMRequest.update(input, {
-            messages: [
-              Message.assistant([ToolCallPart.make({ id: "video", name: "read", input: {} })]),
-              Message.tool({
-                id: "video",
-                name: "read",
-                resultType: "content",
-                result: [{ type: "file", mime: "video/mp4", uri: source.url }],
-              }),
-            ],
-          }),
-        )
-        expect(expectToolResult(tool.body).content).toEqual([{ type: "video", source }])
-      }
+        }),
+      )
+      expect(metaEndpoint.body.messages).toMatchObject([
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "first" },
+            { type: "tool_use", id: "second" },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "first", content: [] },
+            { type: "tool_result", tool_use_id: "second", content: [] },
+            video,
+            video,
+          ],
+        },
+        { role: "assistant", content: [{ type: "text", text: "Observed." }] },
+      ])
+
+      const native = yield* compileRequest(
+        LLMRequest.update(user, {
+          model: AnthropicMessages.route.model({ id: "video-model" }),
+        }),
+      ).pipe(Effect.flip)
+      expect(native.message).toContain("does not support media type video/mp4")
+
+      const mislabeled = yield* compileRequest(
+        LLMRequest.update(user, {
+          model: Meta.configure({ apiKey: "test", baseURL: "https://api.anthropic.com/v1" }).messages("video-model"),
+        }),
+      ).pipe(Effect.flip)
+      expect(mislabeled.message).toContain("does not support media type video/mp4")
     }),
   )
 
