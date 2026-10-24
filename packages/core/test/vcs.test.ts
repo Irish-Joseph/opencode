@@ -707,6 +707,62 @@ describe("Vcs", () => {
     ),
   )
 
+  it.live("scopes the per-file patch fallback to pathspec magic file names", () =>
+    withGit((directory) =>
+      Effect.gen(function* () {
+        // `[a].txt` is a glob character class to Git pathspecs; `a.txt` is the sibling it could match.
+        yield* Effect.promise(async () => {
+          await fs.writeFile(path.join(directory, "[a].txt"), "one\n")
+          await fs.writeFile(path.join(directory, "a.txt"), "two\n")
+          await commitAll(directory, "initial")
+          await fs.writeFile(path.join(directory, "[a].txt"), "one\nthree\n")
+          await fs.writeFile(path.join(directory, "a.txt"), "two\nfour\n")
+        })
+        const vcs = yield* Vcs.Service
+        const processes = yield* AppProcess.Service
+        let perFileArgs: string[] | undefined
+        // Drop the magic-named file from the batch patch so the per-file fallback runs for it.
+        const context = host()
+        yield* VcsGitPlugin.Plugin.effect({
+          ...context,
+          vcs: { ...context.vcs, transform: vcs.transform, reload: vcs.reload },
+        }).pipe(
+          Effect.provideService(
+            AppProcess.Service,
+            AppProcess.Service.of({
+              ...processes,
+              run: (command, options) => {
+                const args = "args" in command ? [...command.args] : []
+                const batched = args.includes("--patch") && args[args.length - 1] === "."
+                if (!batched) {
+                  if (args.includes("--patch")) perFileArgs = args
+                  return processes.run(command, options)
+                }
+                return processes.run(command, options).pipe(
+                  Effect.map((result) => {
+                    const text = result.stdout.toString("utf8")
+                    const kept = text.replace(/(?:^|\n)diff --git a\/\[a\]\.txt[\s\S]*?(?=\ndiff --git |$)/, "")
+                    return { ...result, stdout: Buffer.from(kept) }
+                  }),
+                )
+              },
+            }),
+          ),
+        )
+        const diff = yield* vcs.diff("working")
+        expect(diff.map((item) => ({ file: item.file, status: item.status }))).toEqual([
+          { file: "[a].txt", status: "modified" },
+          { file: "a.txt", status: "modified" },
+        ])
+        const magic = diff.find((item) => item.file === "[a].txt")
+        expect(perFileArgs).toContain("--literal-pathspecs")
+        expect(magic?.patch).toContain("+three")
+        expect(magic?.patch).not.toContain("a.txt")
+        expect(magic?.patch).not.toContain("+four")
+      }),
+    ),
+  )
+
   it.live("diffs before the first commit", () =>
     withGit((directory) =>
       Effect.gen(function* () {

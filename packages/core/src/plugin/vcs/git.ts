@@ -401,6 +401,8 @@ function makeGit(proc: AppProcess.Interface, env?: Record<string, string>) {
   const patch = Effect.fn("VcsGit.patch")(function* (cwd: string, ref: string, file: string, options?: PatchOptions) {
     const result = yield* run(
       [
+        // The file is literal so names containing pathspec magic such as `[` or `:` match only themselves.
+        "--literal-pathspecs",
         "diff",
         "--patch",
         "--no-ext-diff",
