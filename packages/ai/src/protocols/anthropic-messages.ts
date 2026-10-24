@@ -686,48 +686,17 @@ const citationsFromMetadata = (metadata: MediaPart["metadata"]): AnthropicDocume
 
 const isHttpUrl = (value: string) => /^https?:\/\//i.test(value.trim())
 
-const videoProvider = (request: LLMRequest) => {
-  const host = URL.parse(request.model.route.endpoint.baseURL ?? "")?.hostname
-  if (["api.anthropic.com", "api.openai.com", "api.deepseek.com", "api.x.ai"].includes(host ?? "")) return undefined
-  if (["api.minimax.io", "api.minimax.cn", "api.minimaxi.com"].includes(host ?? "")) return "minimax"
-  if (["api.moonshot.ai", "api.moonshot.cn", "api.kimi.ai", "api.kimi.com"].includes(host ?? "")) return "moonshot"
-  if (host === "api.meta.ai") return "meta"
-  for (const identity of [
-    request.model.route.providerMetadataKey,
-    request.model.route.provider,
-    request.model.provider,
-  ]) {
-    const provider = identity?.toLowerCase()
-    if (["minimax", "minimax-cn", "minimax-coding-plan", "minimax-cn-coding-plan"].includes(provider ?? ""))
-      return "minimax"
-    if (["moonshotai", "moonshotai-cn", "moonshot", "kimi", "kimi-for-coding"].includes(provider ?? ""))
-      return "moonshot"
-    if (provider === "meta") return "meta"
-  }
-  return undefined
-}
-
 const lowerMedia = Effect.fnUntraced(function* (part: MediaPart, request: LLMRequest, breakpoints?: Cache.Breakpoints) {
   const mime = part.media.mediaType.toLowerCase()
   const cacheControlValue = breakpoints ? cacheControl(breakpoints, part.cache) : undefined
   if (mime.startsWith("video/")) {
-    const provider = videoProvider(request)
-    if (!provider) return yield* invalid(`${request.model.provider} Messages does not support media type ${mime}`)
     const inline = part.media.inline()
     const reference = yield* ProviderShared.mediaReference(part.media, request.model.provider, "Messages video")
     const source = inline
       ? { type: "base64" as const, media_type: mime, data: inline.base64 }
-      : reference.type === "ref" && provider === "meta"
+      : reference.type === "ref" && !/^[a-z][a-z\d+.-]*:\/\//i.test(reference.value)
         ? { type: "file" as const, file_id: reference.value }
         : { type: "url" as const, url: reference.value }
-    if (source.type === "url") {
-      const accepted =
-        provider === "moonshot"
-          ? source.url.startsWith("ms://")
-          : isHttpUrl(source.url) || (provider === "minimax" && source.url.startsWith("mm_file://"))
-      if (!accepted)
-        return yield* invalid(`${request.model.provider} Messages does not support this video URL or reference`)
-    }
     return {
       type: "video" as const,
       source,
@@ -862,7 +831,11 @@ const lowerToolResultContent = Effect.fnUntraced(function* (
   // Preserve the narrowed array element type when compiled through a consumer package.
   const content: ReadonlyArray<Tool.Content> = part.result.value
   const blocks = yield* Effect.forEach(content, (item) => lowerToolResultContentItem(item, request))
-  if (videoProvider(request) !== "meta") return blocks
+  if (
+    ![request.model.provider, request.model.route.provider, request.model.route.providerMetadataKey].includes("meta") &&
+    URL.parse(request.model.route.endpoint.baseURL ?? "")?.hostname !== "api.meta.ai"
+  )
+    return blocks
   // Meta accepts nested video but does not show it to the model.
   return blocks.filter((block) => {
     if (block.type !== "video") return true
