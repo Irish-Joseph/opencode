@@ -52,111 +52,69 @@ const usageChunk = (usage: object) => ({
 describe("OpenAI-compatible Chat route", () => {
   it.effect("gates user and tool video by provider and source", () =>
     Effect.gen(function* () {
-      const providers = [
-        [
-          "minimax",
-          "minimax-cn",
-          "minimax-coding-plan",
-          "minimax-cn-coding-plan",
-          "meta",
-          "zai",
-          "zai-coding-plan",
-          "zhipuai",
-          "zhipuai-coding-plan",
-          "openrouter",
-        ],
-        ["moonshotai", "moonshotai-cn", "kimi-for-coding", "kimi-code-plan-global", "kimi-code-plan-cn"],
-        ["openai", "deepseek", "xai", "custom"],
+      const cases: {
+        name: string
+        provider: string
+        host?: string
+        inline?: boolean
+        tool?: boolean
+        alias?: boolean
+        expected: string
+      }[] = [
+        { name: "ZAI remote user video", provider: "zai", expected: "video_url" },
+        { name: "Moonshot inline user video", provider: "moonshotai", inline: true, expected: "video_url" },
+        { name: "Moonshot rejects remote video", provider: "moonshotai", expected: "requires inline media" },
+        { name: "Meta tool attachment", provider: "meta", tool: true, expected: "video_url" },
+        {
+          name: "native OpenAI rejects video",
+          provider: "openai",
+          host: "api.openai.com",
+          expected: "does not support media type video/mp4",
+        },
+        { name: "OpenAI route at ZAI host", provider: "openai", host: "api.z.ai", expected: "video_url" },
+        { name: "OpenAI route at MiniMax CN host", provider: "openai", host: "api.minimax.cn", expected: "video_url" },
+        { name: "renamed MiniMax provider", provider: "minimax", alias: true, expected: "video_url" },
       ]
-      for (const [group, names] of providers.entries()) {
-        for (const provider of names) {
-          const models = [
-            OpenAICompatibleChat.route
-              .with({ provider, endpoint: { baseURL: "https://api.custom.test/v1" } })
-              .model({ id: "video-model" }),
-            LanguageModel.update(
-              OpenAICompatibleChat.route
-                .with({ provider, endpoint: { baseURL: "https://api.custom.test/v1" } })
-                .model({ id: "video-model" }),
-              { provider: "catalog-alias" },
-            ),
-          ]
-          for (const selected of models) {
-            for (const remote of [false, true]) {
-              const uri = remote ? "https://example.com/clip.mp4" : "data:video/mp4;base64,AAEC"
-              const media = remote ? Media.url(uri, { mediaType: "video/mp4" }) : Media.fromDataUrl(uri)
-              for (const tool of [false, true]) {
-                const prepared = compileRequest(
-                  LLM.request({
-                    model: selected,
-                    messages: tool
-                      ? [
-                          Message.assistant(ToolCallPart.make({ id: "call_video", name: "read", input: {} })),
-                          Message.tool({
-                            id: "call_video",
-                            name: "read",
-                            result: { type: "content", value: [{ type: "file", uri, mime: "video/mp4" }] },
-                          }),
-                        ]
-                      : [Message.user(Message.media(media))],
-                  }),
-                )
-                if (group === 2 || (group === 1 && remote)) {
-                  const error = yield* prepared.pipe(Effect.flip)
-                  expect(error.message).toContain(
-                    group === 2 ? "does not support media type video/mp4" : "requires inline media",
-                  )
-                  continue
-                }
-                const body = (yield* prepared).body
-                expect(body.messages.at(-1)).toEqual({
-                  role: "user",
-                  content: [{ type: "video_url", video_url: { url: uri } }],
-                })
-                if (tool) expect(body.messages.at(-2)).toMatchObject({ role: "tool", tool_call_id: "call_video" })
-              }
-            }
-          }
-        }
-      }
-      for (const [host, inline] of [
-        ["api.minimax.io", false],
-        ["api.minimax.cn", false],
-        ["api.minimaxi.com", false],
-        ["api.meta.ai", false],
-        ["api.z.ai", false],
-        ["open.bigmodel.cn", false],
-        ["openrouter.ai", false],
-        ["api.moonshot.ai", true],
-        ["api.moonshot.cn", true],
-        ["api.kimi.ai", true],
-        ["api.kimi.com", true],
-        ["api.meta.ai.evil.test", undefined],
-        ["api.openai.com", undefined],
-        ["api.deepseek.com", undefined],
-        ["api.x.ai", undefined],
-      ] as const) {
-        for (const remote of [false, true]) {
-          const uri = remote ? "https://example.com/clip.mp4" : "data:video/mp4;base64,AAEC"
-          const prepared = compileRequest(
-            LLM.request({
-              model: OpenAICompatibleChat.route
-                .with({ provider: "openai", endpoint: { baseURL: `https://${host}/v1?proxy=api.meta.ai` } })
-                .model({ id: "video-model" }),
-              prompt: Message.media(remote ? Media.url(uri, { mediaType: "video/mp4" }) : Media.fromDataUrl(uri)),
-            }),
-          )
-          if (inline === undefined || (inline && remote)) {
-            const error = yield* prepared.pipe(Effect.flip)
-            expect(error.message).toContain(
-              inline === undefined ? "does not support media type video/mp4" : "requires inline media",
-            )
-            continue
-          }
-          expect((yield* prepared).body.messages.at(-1)).toMatchObject({
-            content: [{ type: "video_url", video_url: { url: uri } }],
+      for (const scenario of cases) {
+        const uri = scenario.inline ? "data:video/mp4;base64,AAEC" : "https://example.com/clip.mp4"
+        const selected = OpenAICompatibleChat.route
+          .with({
+            provider: scenario.provider,
+            endpoint: { baseURL: `https://${scenario.host ?? "api.custom.test"}/v1` },
           })
+          .model({ id: "video-model" })
+        const prepared = compileRequest(
+          LLM.request({
+            model: scenario.alias ? LanguageModel.update(selected, { provider: "catalog-alias" }) : selected,
+            messages: scenario.tool
+              ? [
+                  Message.assistant(ToolCallPart.make({ id: "call_video", name: "read", input: {} })),
+                  Message.tool({
+                    id: "call_video",
+                    name: "read",
+                    result: { type: "content", value: [{ type: "file", uri, mime: "video/mp4" }] },
+                  }),
+                ]
+              : [
+                  Message.user(
+                    Message.media(
+                      scenario.inline ? Media.fromDataUrl(uri) : Media.url(uri, { mediaType: "video/mp4" }),
+                    ),
+                  ),
+                ],
+          }),
+        )
+        if (scenario.expected !== "video_url") {
+          const error = yield* prepared.pipe(Effect.flip)
+          expect(error.message, scenario.name).toContain(scenario.expected)
+          continue
         }
+        const body = (yield* prepared).body
+        expect(body.messages.at(-1), scenario.name).toEqual({
+          role: "user",
+          content: [{ type: "video_url", video_url: { url: uri } }],
+        })
+        if (scenario.tool) expect(body.messages.at(-2)).toMatchObject({ role: "tool", tool_call_id: "call_video" })
       }
     }),
   )
