@@ -56,7 +56,7 @@ for (const mode of ["compact", "ungrouped"] as const) {
 
     if (process.env.LAGGY_HTTP === "1")
       page.on("request", (request) => {
-        const match = new URL(request.url()).pathname.match(/^\/api\/session\/([^/]+)\/message$/)
+        const match = new URL(request.url()).pathname.match(/^\/api\/experimental\/session\/([^/]+)\/timeline$/)
 
         if (request.method() === "GET" && match) requests.push(decodeURIComponent(match[1]))
       })
@@ -197,7 +197,8 @@ for (const mode of ["compact", "ungrouped"] as const) {
           return (performance.getEntriesByType("resource") as PerformanceResourceTiming[])
             .filter(
               (entry) =>
-                entry.startTime >= start && new URL(entry.name).pathname === `/api/session/${sessionID}/message`,
+                entry.startTime >= start &&
+                new URL(entry.name).pathname === `/api/experimental/session/${sessionID}/timeline`,
             )
             .map((entry) => ({
               limit: Number(new URL(entry.name).searchParams.get("limit")),
