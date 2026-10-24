@@ -61,6 +61,7 @@ test("keeps the parent title anchored when opening a subagent", async ({ page })
     // Measuring before then can read the detached heading, whose empty bounds put the start at 0.
     const agents = page.getByRole("button", { name: "Used 1 Agent", exact: true })
     await expect(agents).toBeVisible()
+
     const start = await titleInlineStart(
       page.locator("[data-session-title]").getByRole("heading", { name: parentTitle }),
     )

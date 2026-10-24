@@ -11,6 +11,7 @@ import { startChromeTrace } from "../chrome-trace"
 
 const file = process.env.LAGGY_SESSION_FILE
 
+// SAFETY: LAGGY_SESSION_FILE is a session export (see laggy-session-benchmark.md), which has this shape.
 const session = file
   ? (JSON.parse(readFileSync(file, "utf8")) as {
       info: {
@@ -194,6 +195,7 @@ for (const mode of ["compact", "ungrouped"] as const) {
         messageResources: await page.evaluate((sessionID) => {
           const start = performance.getEntriesByName("session-switch:start").at(-1)!.startTime
 
+          // SAFETY: entries of type "resource" are always PerformanceResourceTiming.
           return (performance.getEntriesByType("resource") as PerformanceResourceTiming[])
             .filter(
               (entry) =>
