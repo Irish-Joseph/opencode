@@ -60,7 +60,7 @@ const OpenResponsesInputVideo = Schema.Struct({
   type: Schema.tag("input_video"),
   video_url: Schema.String,
 })
-const MediaInput = Schema.Union([OpenResponsesInputImage, OpenResponsesInputFile])
+const MediaInput = Schema.Union([OpenResponsesInputImage, OpenResponsesInputFile, OpenResponsesInputVideo])
 export type MediaInput = Schema.Schema.Type<typeof MediaInput>
 const OpenResponsesInputContent = Schema.Union([OpenResponsesInputText, MediaInput])
 
@@ -513,12 +513,54 @@ const lowerReasoning = (part: ReasoningPart, providerMetadataKey: string): OpenR
 const decodeImageDetail = ProviderShared.validateWith(Schema.decodeUnknownEffect(OpenResponsesInputImage.fields.detail))
 const decodeMessageMetadata = ProviderShared.validateWith(Schema.decodeUnknownEffect(MessageMetadata))
 
+const videoProviders: Readonly<Record<string, string>> = {
+  "api.openai.com": "openai",
+  "api.minimax.io": "minimax",
+  "api.minimax.cn": "minimax",
+  "api.meta.ai": "meta",
+  "api.x.ai": "xai",
+  "api.moonshot.ai": "moonshotai",
+  "api.moonshot.cn": "moonshotai",
+  "api.deepseek.com": "deepseek",
+  "openai-responses": "openai",
+  "minimax-responses": "minimax",
+  "meta-responses": "meta",
+  "xai-responses": "xai",
+  "moonshot-responses": "moonshotai",
+  openai: "openai",
+  azure: "azure",
+  minimax: "minimax",
+  "minimax-cn": "minimax",
+  "minimax-coding-plan": "minimax",
+  "minimax-cn-coding-plan": "minimax",
+  meta: "meta",
+  xai: "xai",
+  moonshot: "moonshotai",
+  moonshotai: "moonshotai",
+  "moonshotai-cn": "moonshotai",
+  deepseek: "deepseek",
+}
+
+// An actual vendor host wins; proxies retain the route's family when Core renames the provider.
+const videoProvider = (request: LLMRequest) =>
+  [
+    URL.parse(request.model.route.endpoint.baseURL ?? "")?.hostname,
+    request.model.route.id,
+    request.model.route.providerMetadataKey,
+    request.model.provider,
+  ]
+    .map((identity) => videoProviders[identity ?? ""])
+    .find((provider) => provider !== undefined) ?? request.model.provider
+
 const lowerMedia = Effect.fnUntraced(function* (
   part: MediaPart,
   request: LLMRequest,
   adapter: ProviderAdapter,
   target: "message" | "tool-result",
 ) {
+  const provider = videoProvider(request)
+  if (part.media.kind === "video" && ["openai", "azure", "moonshotai", "deepseek"].includes(provider))
+    return yield* ProviderShared.invalidRequest(`${provider} Responses does not support video input`)
   const media = part.media.inline()
   const providerMedia = adapter.lowerMedia?.({ part, media, request })
   if (providerMedia) return providerMedia
@@ -528,7 +570,10 @@ const lowerMedia = Effect.fnUntraced(function* (
   const url = ProviderShared.mediaUrl(part.media)
   const location = url ?? (yield* ProviderShared.requireInlineMedia(adapter.name, part.media)).dataUrl
   if (part.media.kind !== "image") {
-    if (target === "tool-result" && part.media.kind === "video")
+    if (
+      part.media.kind === "video" &&
+      (provider === "minimax" || provider === "meta" || (provider !== "xai" && target === "tool-result"))
+    )
       return { type: "input_video" as const, video_url: location }
     return {
       type: "input_file" as const,
@@ -555,10 +600,7 @@ const lowerUserContent = Effect.fnUntraced(function* (
 })
 
 const lowerMessageMedia = Effect.fnUntraced(function* (part: MediaPart, request: LLMRequest, adapter: ProviderAdapter) {
-  const lowered = yield* lowerMedia(part, request, adapter, "message")
-  if (lowered.type === "input_video")
-    return yield* ProviderShared.invalidRequest(`${adapter.name} user messages do not support input_video`)
-  return lowered
+  return yield* lowerMedia(part, request, adapter, "message")
 })
 
 // Tool results may carry structured text, images, and files. Keep media as provider-native
@@ -602,6 +644,7 @@ const lowerMessages = Effect.fnUntraced(function* (
 ) {
   const input: OpenResponsesInputItem[] = []
   const providerMetadataKey = metadataKey(request.model)
+  const provider = videoProvider(request)
 
   for (const message of request.messages) {
     const rawMetadata = message.providerMetadata?.[providerMetadataKey]
@@ -748,11 +791,21 @@ const lowerMessages = Effect.fnUntraced(function* (
     for (const part of message.content) {
       if (!ProviderShared.supportsContent(part, ["tool-result"]))
         return yield* ProviderShared.unsupportedContent(adapter.name, "tool", ["tool-result"])
+      const output = yield* lowerToolResultOutput(part, request, adapter)
+      // Meta only sees video in ordinary user content, not nested function outputs.
+      const videos =
+        provider === "meta" && typeof output !== "string" ? output.filter((item) => item.type === "input_video") : []
+      const content =
+        videos.length > 0 && typeof output !== "string" ? output.filter((item) => item.type !== "input_video") : output
       input.push({
         type: "function_call_output",
         call_id: part.id,
-        output: yield* lowerToolResultOutput(part, request, adapter),
+        output:
+          videos.length > 0 && typeof content !== "string" && content.length === 0
+            ? "Video attached in the following user message."
+            : content,
       })
+      if (videos.length > 0) input.push({ type: "message", role: "user", content: videos })
     }
   }
 
