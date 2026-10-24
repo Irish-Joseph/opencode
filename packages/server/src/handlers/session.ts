@@ -227,14 +227,10 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         Effect.fn(function* (ctx) {
           yield* session.get(ctx.params.sessionID).pipe(Effect.catchTag("Session.NotFoundError", missingSession))
           if (ctx.payload.title !== undefined) {
-            if (ctx.payload.title) {
-              yield* session
-                .rename({ sessionID: ctx.params.sessionID, title: ctx.payload.title })
-                .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
-            } else {
-              const title = yield* SessionTitle.Service
-              yield* title.generate(ctx.params.sessionID)
-            }
+            const title = yield* SessionTitle.Service
+            yield* title
+              .update(ctx.params.sessionID, ctx.payload.title)
+              .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
           }
           if (ctx.payload.metadata !== undefined)
             yield* session

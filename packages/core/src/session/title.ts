@@ -12,6 +12,7 @@ import { llmClient } from "../effect/app-node-platform.js"
 import { SessionContext } from "./context.js"
 import { SessionEvent } from "./event.js"
 import { SessionHistory } from "./history.js"
+import { NotFoundError } from "./error.js"
 import type { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
 import { SessionUsage } from "./usage.js"
@@ -25,6 +26,8 @@ const titleChanged = Symbol("Session title changed")
 export interface Interface {
   /** Generates an initial title or regenerates one from bounded conversation history. */
   readonly generate: (sessionID: SessionSchema.ID) => Effect.Effect<void>
+  /** Sets the title, or regenerates one when given an empty title, like the session.update route. */
+  readonly update: (sessionID: SessionSchema.ID, title: string) => Effect.Effect<void, NotFoundError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionTitle") {}
@@ -152,7 +155,14 @@ export const layer = Layer.effect(
         )
         .pipe(Effect.catchDefect((defect) => (defect === titleChanged ? Effect.void : Effect.die(defect))))
     })
-    return Service.of({ generate })
+    // Resolving the Session facade here would cycle back through the runner graph that serves
+    // this service, so the rename is the same Renamed event the facade publishes.
+    const update = Effect.fn("SessionTitle.update")(function* (sessionID: SessionSchema.ID, title: string) {
+      if (!(yield* store.get(sessionID))) return yield* new NotFoundError({ sessionID })
+      if (title) return yield* bus.publish(SessionEvent.Renamed, { sessionID, title })
+      return yield* generate(sessionID)
+    })
+    return Service.of({ generate, update })
   }),
 )
 

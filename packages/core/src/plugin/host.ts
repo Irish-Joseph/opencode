@@ -19,6 +19,7 @@ import { LocationServiceMap } from "../location-service-map.js"
 import { Model } from "../model.js"
 import { Mcp } from "../mcp/index.js"
 import { Session } from "../session.js"
+import { SessionTitle } from "../session/title.js"
 import { PersistentPty } from "../persistent-pty.js"
 import { Provider } from "../provider.js"
 import { Reference } from "../reference.js"
@@ -571,14 +572,31 @@ export const make = Effect.fn("PluginHost.make")(function* (
       generate: (input) => sessions.generate(input).pipe(Effect.map((text) => ({ text }))),
       command: (input) => sessions.command({ ...input, command: input.name }),
       compact: sessions.compact,
-      update: Effect.fn(function* (input) {
-        yield* sessions.get(input.sessionID)
-        if (input.title !== undefined) yield* sessions.rename({ sessionID: input.sessionID, title: input.title })
-        if (input.metadata !== undefined)
-          yield* sessions.setMetadata({ sessionID: input.sessionID, metadata: input.metadata })
-        if (input.permissions !== undefined)
-          yield* sessions.setPermissions({ sessionID: input.sessionID, permissions: input.permissions })
-      }),
+      update: (input) =>
+        Effect.gen(function* () {
+          yield* sessions.get(input.sessionID)
+          if (input.title !== undefined) {
+            if (input.title === "") {
+              // Same semantics as the session.update route: an empty title asks for a
+              // regenerated one instead of clearing the current title. Resolve the title
+              // service in the session's location, and only when regeneration is requested.
+              const title = yield* SessionTitle.Service.pipe(
+                Effect.provide(
+                  locations.get(
+                    Location.Ref.make({ directory: location.directory, workspaceID: location.workspaceID }),
+                  ),
+                ),
+              )
+              yield* title.update(input.sessionID, input.title)
+            } else {
+              yield* sessions.rename({ sessionID: input.sessionID, title: input.title })
+            }
+          }
+          if (input.metadata !== undefined)
+            yield* sessions.setMetadata({ sessionID: input.sessionID, metadata: input.metadata })
+          if (input.permissions !== undefined)
+            yield* sessions.setPermissions({ sessionID: input.sessionID, permissions: input.permissions })
+        }),
       move: sessions.move,
       synthetic: sessions.synthetic,
       interrupt: (input) =>

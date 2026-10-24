@@ -34,7 +34,8 @@ import { Model } from "@opencode/core/model"
 import { Provider } from "@opencode/core/provider"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Money } from "@opencode/schema/money"
-import { Deferred, Effect, Fiber, Layer, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { NotFoundError } from "../src/session/error.js"
 import { testEffect } from "./lib/effect"
 
 let requests: LLMRequest[] = []
@@ -672,5 +673,44 @@ it.effect("preserves a manual rename completed while generation is in flight", (
     const store = yield* SessionStore.Service
     expect(requests).toHaveLength(1)
     expect((yield* store.get(sessionID))?.title).toBe("Manual title")
+  }),
+)
+
+it.effect("update sets a named title without a model request", () =>
+  Effect.gen(function* () {
+    const sessionID = Session.ID.make("ses_title_update_named")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "Name this session")
+
+    const title = yield* SessionTitle.Service
+    yield* title.update(sessionID, "Named title")
+
+    const store = yield* SessionStore.Service
+    expect(requests).toHaveLength(0)
+    expect((yield* store.get(sessionID))?.title).toBe("Named title")
+  }),
+)
+
+it.effect("update with an empty title regenerates instead of clearing", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_update_empty")
+    yield* insertSession(sessionID, "Original title")
+    yield* prompt(sessionID, "Regenerate my title")
+
+    const title = yield* SessionTitle.Service
+    yield* title.update(sessionID, "")
+
+    const store = yield* SessionStore.Service
+    expect(requests).toHaveLength(1)
+    expect((yield* store.get(sessionID))?.title).toBe("Generated Title")
+  }),
+)
+
+it.effect("update reports an unknown session", () =>
+  Effect.gen(function* () {
+    const title = yield* SessionTitle.Service
+    const exit = yield* title.update(Session.ID.make("ses_title_update_missing"), "x").pipe(Effect.exit)
+    expect(Exit.isFailure(exit) && Cause.squash(exit.cause)).toEqual(new NotFoundError({ sessionID: Session.ID.make("ses_title_update_missing") }))
   }),
 )
