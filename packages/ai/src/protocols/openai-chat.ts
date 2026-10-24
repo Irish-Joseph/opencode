@@ -129,6 +129,10 @@ const OpenAIChatUserContent = Schema.Union([
     image_url: Schema.Struct({ url: Schema.String }),
   }),
   Schema.Struct({
+    type: Schema.Literal("video_url"),
+    video_url: Schema.Struct({ url: Schema.String }),
+  }),
+  Schema.Struct({
     type: Schema.Literal("file"),
     file: Schema.Struct({ filename: Schema.String, file_data: Schema.String }),
   }),
@@ -325,6 +329,7 @@ export interface ParserState {
 // OpenAI Chat wire format. Keep provider quirks here instead of leaking native
 // fields into `LLMRequest`.
 interface LoweringOptions {
+  readonly video?: "inline" | "url"
   readonly cacheControl?: (cache: CacheHint | undefined) => OpenAIChatCacheControl | undefined
   readonly toolCallID?: (id: string) => string
   /** Project provider-specific fields from the exact source, even when other messages are dropped during lowering. */
@@ -363,7 +368,7 @@ const lowerToolCall = (
   extra_content: decodeExtraContent(part.providerMetadata?.[options.providerMetadataKey]?.extraContent),
 })
 
-const lowerMedia = Effect.fnUntraced(function* (part: MediaPart) {
+const lowerMedia = Effect.fnUntraced(function* (part: MediaPart, options: LoweringOptions) {
   // Chat Completions accepts PDFs, and no other documents, as inline `file` parts; file URLs are not supported.
   if (part.media.mediaType.toLowerCase() === "application/pdf")
     return {
@@ -373,6 +378,12 @@ const lowerMedia = Effect.fnUntraced(function* (part: MediaPart) {
         file_data: (yield* ProviderShared.requireInlineMedia("OpenAI Chat", part.media)).dataUrl,
       },
     }
+  if (part.media.kind === "video" && options.video !== undefined) {
+    const url =
+      (options.video === "url" ? ProviderShared.mediaUrl(part.media) : undefined) ??
+      (yield* ProviderShared.requireInlineMedia("OpenAI Chat video", part.media)).dataUrl
+    return { type: "video_url" as const, video_url: { url } }
+  }
   if (part.media.kind !== "image")
     return yield* ProviderShared.invalidRequest(`OpenAI Chat does not support media type ${part.media.mediaType}`)
   const url =
@@ -420,7 +431,7 @@ const lowerUserMessage = Effect.fnUntraced(function* (
       continue
     }
     if (part.type === "media") {
-      content.push(yield* lowerMedia(part))
+      content.push(yield* lowerMedia(part, options))
       continue
     }
     return yield* ProviderShared.unsupportedContent("OpenAI Chat", "user", ["text", "media"])
@@ -523,7 +534,9 @@ const lowerToolMessages = Effect.fnUntraced(function* (
       toolMessage(options.toolCallID?.(part.id) ?? part.id, text.join("\n"), options.cacheControl?.(part.cache)),
     )
     const files = content.filter((item) => item.type === "file")
-    attachments.push(...(yield* Effect.forEach(files, (item) => lowerMedia(ProviderShared.toolFileMedia(item)))))
+    attachments.push(
+      ...(yield* Effect.forEach(files, (item) => lowerMedia(ProviderShared.toolFileMedia(item), options))),
+    )
   }
   return { messages, attachments }
 })
@@ -577,6 +590,7 @@ const lowerMessages = Effect.fnUntraced(function* (request: LLMRequest, options:
   const mistral = ["mistral", "devstral", "codestral", "pixtral", "mixtral"].some((family) => modelID.includes(family))
   const lowering = {
     ...options,
+    video: detectVideoInput(request.model),
     providerMetadataKey: request.model.route.providerMetadataKey ?? request.model.provider,
     toolCallID: (id: string) => {
       if (mistral)
@@ -663,6 +677,49 @@ const lowerMessages = Effect.fnUntraced(function* (request: LLMRequest, options:
   flushAttachments()
   return messages
 })
+
+const detectVideoInput = (model: LLMRequest["model"]): LoweringOptions["video"] => {
+  const hosts: Readonly<Record<string, string>> = {
+    "api.minimax.io": "minimax",
+    "api.minimaxi.com": "minimax",
+    "api.moonshot.ai": "moonshotai",
+    "api.moonshot.cn": "moonshotai",
+    "api.kimi.ai": "moonshotai",
+    "api.kimi.com": "moonshotai",
+    "api.meta.ai": "meta",
+    "api.z.ai": "zai",
+    "open.bigmodel.cn": "zai",
+    "openrouter.ai": "openrouter",
+    "api.openai.com": "openai",
+    "api.deepseek.com": "deepseek",
+    "api.x.ai": "xai",
+  }
+  // Core may rename the model's provider; the route retains its original family.
+  const provider = (
+    hosts[URL.parse(model.route.endpoint.baseURL ?? "")?.hostname ?? ""] ??
+    model.route.provider ??
+    model.provider
+  ).toLowerCase()
+  if (
+    ["moonshotai", "moonshotai-cn", "kimi-for-coding", "kimi-code-plan-global", "kimi-code-plan-cn"].includes(provider)
+  )
+    return "inline"
+  if (
+    [
+      "minimax",
+      "minimax-cn",
+      "minimax-coding-plan",
+      "minimax-cn-coding-plan",
+      "meta",
+      "zai",
+      "zai-coding-plan",
+      "zhipuai",
+      "zhipuai-coding-plan",
+      "openrouter",
+    ].includes(provider)
+  )
+    return "url"
+}
 
 // Anthropic via LiteLLM and Amazon Bedrock require `tools` to be present
 // whenever the conversation history contains tool calls/results. Send an
