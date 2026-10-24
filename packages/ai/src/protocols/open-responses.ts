@@ -513,54 +513,18 @@ const lowerReasoning = (part: ReasoningPart, providerMetadataKey: string): OpenR
 const decodeImageDetail = ProviderShared.validateWith(Schema.decodeUnknownEffect(OpenResponsesInputImage.fields.detail))
 const decodeMessageMetadata = ProviderShared.validateWith(Schema.decodeUnknownEffect(MessageMetadata))
 
-const videoProviders: Readonly<Record<string, string>> = {
-  "api.openai.com": "openai",
-  "api.minimax.io": "minimax",
-  "api.minimax.cn": "minimax",
-  "api.meta.ai": "meta",
-  "api.x.ai": "xai",
-  "api.moonshot.ai": "moonshotai",
-  "api.moonshot.cn": "moonshotai",
-  "api.deepseek.com": "deepseek",
-  "openai-responses": "openai",
-  "minimax-responses": "minimax",
-  "meta-responses": "meta",
-  "xai-responses": "xai",
-  "moonshot-responses": "moonshotai",
-  openai: "openai",
-  azure: "azure",
-  minimax: "minimax",
-  "minimax-cn": "minimax",
-  "minimax-coding-plan": "minimax",
-  "minimax-cn-coding-plan": "minimax",
-  meta: "meta",
-  xai: "xai",
-  moonshot: "moonshotai",
-  moonshotai: "moonshotai",
-  "moonshotai-cn": "moonshotai",
-  deepseek: "deepseek",
+const videoProvider = (request: LLMRequest) => {
+  const hostname = URL.parse(request.model.route.endpoint.baseURL ?? "")?.hostname
+  if (hostname === "api.x.ai") return "xai"
+  if (hostname === "api.meta.ai") return "meta"
+  return [request.model.route.id, request.model.route.providerMetadataKey, request.model.provider]
+    .find(
+      (provider) => provider === "xai" || provider === "meta" || provider === "xai-responses" || provider === "meta-responses",
+    )
+    ?.replace("-responses", "")
 }
 
-// An actual vendor host wins; proxies retain the route's family when Core renames the provider.
-const videoProvider = (request: LLMRequest) =>
-  [
-    URL.parse(request.model.route.endpoint.baseURL ?? "")?.hostname,
-    request.model.route.id,
-    request.model.route.providerMetadataKey,
-    request.model.provider,
-  ]
-    .map((identity) => videoProviders[identity ?? ""])
-    .find((provider) => provider !== undefined) ?? request.model.provider
-
-const lowerMedia = Effect.fnUntraced(function* (
-  part: MediaPart,
-  request: LLMRequest,
-  adapter: ProviderAdapter,
-  target: "message" | "tool-result",
-) {
-  const provider = videoProvider(request)
-  if (part.media.kind === "video" && ["openai", "azure", "moonshotai", "deepseek"].includes(provider))
-    return yield* ProviderShared.invalidRequest(`${provider} Responses does not support video input`)
+const lowerMedia = Effect.fnUntraced(function* (part: MediaPart, request: LLMRequest, adapter: ProviderAdapter) {
   const media = part.media.inline()
   const providerMedia = adapter.lowerMedia?.({ part, media, request })
   if (providerMedia) return providerMedia
@@ -570,10 +534,7 @@ const lowerMedia = Effect.fnUntraced(function* (
   const url = ProviderShared.mediaUrl(part.media)
   const location = url ?? (yield* ProviderShared.requireInlineMedia(adapter.name, part.media)).dataUrl
   if (part.media.kind !== "image") {
-    if (
-      part.media.kind === "video" &&
-      (provider === "minimax" || provider === "meta" || (provider !== "xai" && target === "tool-result"))
-    )
+    if (part.media.kind === "video" && videoProvider(request) !== "xai")
       return { type: "input_video" as const, video_url: location }
     return {
       type: "input_file" as const,
@@ -595,12 +556,8 @@ const lowerUserContent = Effect.fnUntraced(function* (
   adapter: ProviderAdapter,
 ) {
   if (part.type === "text") return { type: "input_text" as const, text: part.text }
-  if (part.type === "media") return yield* lowerMessageMedia(part, request, adapter)
+  if (part.type === "media") return yield* lowerMedia(part, request, adapter)
   return yield* ProviderShared.unsupportedContent(adapter.name, "user", ["text", "media"])
-})
-
-const lowerMessageMedia = Effect.fnUntraced(function* (part: MediaPart, request: LLMRequest, adapter: ProviderAdapter) {
-  return yield* lowerMedia(part, request, adapter, "message")
 })
 
 // Tool results may carry structured text, images, and files. Keep media as provider-native
@@ -611,16 +568,7 @@ const lowerToolResultContentItem = Effect.fnUntraced(function* (
   adapter: ProviderAdapter,
 ) {
   if (item.type === "text") return { type: "input_text" as const, text: item.text }
-  return yield* lowerMedia(ProviderShared.toolFileMedia(item), request, adapter, "tool-result")
-})
-
-const lowerHostedToolResultContentItem = Effect.fnUntraced(function* (
-  item: Content,
-  request: LLMRequest,
-  adapter: ProviderAdapter,
-) {
-  if (item.type === "text") return { type: "input_text" as const, text: item.text }
-  return yield* lowerMessageMedia(ProviderShared.toolFileMedia(item), request, adapter)
+  return yield* lowerMedia(ProviderShared.toolFileMedia(item), request, adapter)
 })
 
 const lowerToolResultOutput = Effect.fnUntraced(function* (
@@ -768,7 +716,7 @@ const lowerMessages = Effect.fnUntraced(function* (
           input.push({
             type: "message",
             role: "user",
-            content: yield* Effect.forEach(content, (item) => lowerHostedToolResultContentItem(item, request, adapter)),
+            content: yield* Effect.forEach(content, (item) => lowerToolResultContentItem(item, request, adapter)),
           })
           continue
         }
@@ -778,7 +726,7 @@ const lowerMessages = Effect.fnUntraced(function* (
           input.push({
             type: "message",
             role: "user",
-            content: [yield* lowerMessageMedia(part, request, adapter)],
+            content: [yield* lowerMedia(part, request, adapter)],
           })
           continue
         }

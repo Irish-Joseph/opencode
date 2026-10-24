@@ -31,7 +31,7 @@ import * as Azure from "../../src/providers/azure.js"
 import * as OpenAI from "../../src/providers/openai.js"
 import * as XAI from "../../src/providers/xai.js"
 import { Meta } from "../../src/providers/meta.js"
-import { MiniMax } from "../../src/providers/minimax.js"
+import { OpenAICompatibleResponses } from "../../src/protocols/openai-compatible-responses.js"
 import * as OpenAIResponses from "../../src/protocols/openai-responses.js"
 import { OpenResponses } from "../../src/protocols/open-responses.js"
 import { OpenResponsesContinuation } from "../../src/protocols/open-responses-continuation.js"
@@ -1906,29 +1906,19 @@ describe("OpenAI Responses route", () => {
         },
       ]
       for (const item of [
+        {
+          name: "unknown provider uses input_video for user and tool video",
+          model: OpenAICompatibleResponses.route
+            .with({ provider: "custom", endpoint: { baseURL: "https://provider.example/v1" } })
+            .model({ id: "video-model" }),
+          input: videoInput,
+        },
+        { name: "native OpenAI serialization also uses input_video", model, input: videoInput },
         { name: "xAI user and tool video", model: xaiModel, input: fileInput },
-        {
-          name: "MiniMax user and tool video",
-          model: MiniMax.configure({ apiKey: "test" }).responses("MiniMax-M3"),
-          input: videoInput,
-        },
-        {
-          name: "MiniMax alias through a proxy",
-          model: LanguageModel.update(
-            MiniMax.configure({ apiKey: "test", baseURL: "https://proxy.example/v1" }).responses("MiniMax-M3"),
-            { provider: "minimax-cn" },
-          ),
-          input: videoInput,
-        },
       ]) {
         const prepared = yield* compileRequest(LLM.request({ model: item.model, messages }))
         expect(prepared.body.input, item.name).toMatchObject(item.input)
       }
-
-      const rejected = yield* compileRequest(LLM.request({ model, prompt: { type: "media", media } })).pipe(Effect.flip)
-      expect(rejected).toMatchObject({
-        reason: { _tag: "InvalidRequest", message: "openai Responses does not support video input" },
-      })
 
       const metaRequest = LLM.request({
         model: Meta.configure({ apiKey: "test" }).responses("muse-spark-1.3"),
