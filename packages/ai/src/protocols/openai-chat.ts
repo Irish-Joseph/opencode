@@ -681,6 +681,7 @@ const lowerMessages = Effect.fnUntraced(function* (request: LLMRequest, options:
 const detectVideoInput = (model: LLMRequest["model"]): LoweringOptions["video"] => {
   const hosts: Readonly<Record<string, string>> = {
     "api.minimax.io": "minimax",
+    "api.minimax.cn": "minimax",
     "api.minimaxi.com": "minimax",
     "api.moonshot.ai": "moonshotai",
     "api.moonshot.cn": "moonshotai",

@@ -121,6 +121,7 @@ describe("OpenAI-compatible Chat route", () => {
       }
       for (const [host, inline] of [
         ["api.minimax.io", false],
+        ["api.minimax.cn", false],
         ["api.minimaxi.com", false],
         ["api.meta.ai", false],
         ["api.z.ai", false],
