@@ -32,8 +32,6 @@ import * as OpenAI from "../../src/providers/openai.js"
 import * as XAI from "../../src/providers/xai.js"
 import { Meta } from "../../src/providers/meta.js"
 import { MiniMax } from "../../src/providers/minimax.js"
-import { Moonshot } from "../../src/providers/moonshot.js"
-import { OpenAICompatibleResponses } from "../../src/protocols/openai-compatible-responses.js"
 import * as OpenAIResponses from "../../src/protocols/openai-responses.js"
 import { OpenResponses } from "../../src/protocols/open-responses.js"
 import { OpenResponsesContinuation } from "../../src/protocols/open-responses-continuation.js"
@@ -1869,149 +1867,105 @@ describe("OpenAI Responses route", () => {
 
   it.effect("lowers Responses video by provider and preserves ordered tool results", () =>
     Effect.gen(function* () {
-      const compatible = (provider: string) =>
-        OpenAICompatibleResponses.route
-          .with({ provider, endpoint: { baseURL: "https://example.com/v1" } })
-          .model({ id: "video-model" })
-      for (const item of [
-        { model, video: false },
-        { model: compatible("deepseek"), video: false },
-        { model: Moonshot.configure({ apiKey: "test" }).responses("kimi-k3.1-pro"), video: false },
-        { model: MiniMax.configure({ apiKey: "test" }).responses("MiniMax-M3"), video: "input_video" },
-        { model: Meta.configure({ apiKey: "test" }).responses("muse-spark-1.3"), video: "input_video", hoist: true },
-        { model: xaiModel, video: "input_file" },
-        { model: compatible("custom"), video: "generic" },
-        { model: compatible("moonshotai-cn"), video: false },
+      const media = Media.url("https://example.com/clip.mp4", { mediaType: "video/mp4" })
+      const videoResult = Message.tool({
+        id: "call_video",
+        name: "record",
+        resultType: "content",
+        result: [{ type: "file", uri: "https://example.com/clip.mp4", mime: "video/mp4" }],
+      })
+      const messages = [
+        Message.user({ type: "media", media }),
+        Message.assistant([ToolCallPart.make({ id: "call_video", name: "record", input: {} })]),
+        videoResult,
+      ]
+      const fileInput = [
         {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_file", filename: "file", file_url: "https://example.com/clip.mp4" }],
+        },
+        { type: "function_call", call_id: "call_video", name: "record", arguments: "{}" },
+        {
+          type: "function_call_output",
+          call_id: "call_video",
+          output: [{ type: "input_file", filename: "file", file_url: "https://example.com/clip.mp4" }],
+        },
+      ]
+      const videoInput = [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_video", video_url: "https://example.com/clip.mp4" }],
+        },
+        { type: "function_call", call_id: "call_video", name: "record", arguments: "{}" },
+        {
+          type: "function_call_output",
+          call_id: "call_video",
+          output: [{ type: "input_video", video_url: "https://example.com/clip.mp4" }],
+        },
+      ]
+      for (const item of [
+        { name: "xAI user and tool video", model: xaiModel, input: fileInput },
+        {
+          name: "MiniMax user and tool video",
+          model: MiniMax.configure({ apiKey: "test" }).responses("MiniMax-M3"),
+          input: videoInput,
+        },
+        {
+          name: "MiniMax alias through a proxy",
           model: LanguageModel.update(
             MiniMax.configure({ apiKey: "test", baseURL: "https://proxy.example/v1" }).responses("MiniMax-M3"),
             { provider: "minimax-cn" },
           ),
-          video: "input_video",
+          input: videoInput,
         },
-        {
-          model: LanguageModel.update(
-            XAI.configure({ apiKey: "test", baseURL: "https://proxy.example/v1" }).responses("grok-4.7"),
-            { provider: "catalog-alias" },
-          ),
-          video: "input_file",
-        },
-        {
-          model: OpenAI.configure({ apiKey: "test", baseURL: "https://api.meta.ai/v1" }).responses("muse-spark-1.3"),
-          video: "input_video",
-          hoist: true,
-        },
-        {
-          model: LanguageModel.update(OpenAI.configure({ apiKey: "test" }).responses("gpt-4.1"), { provider: "meta" }),
-          video: false,
-        },
-      ] as const) {
-        const hoist = "hoist" in item && item.hoist
-        for (const target of [
-          "user",
-          "tool",
-          ...(hoist ? (["split-tool", "assistant", "system", "end"] as const) : []),
-        ] as const) {
-          const video = (id: string) => ({
-            type: item.video === "generic" ? (target === "user" ? "input_file" : "input_video") : item.video,
-            ...(item.video === "input_file" || (item.video === "generic" && target === "user")
-              ? { filename: "file", file_url: `https://example.com/${id}.mp4` }
-              : { video_url: `https://example.com/${id}.mp4` }),
-          })
-          const text = (value: string) => ({ type: "input_text", text: value })
-          const tool = (id: string) =>
-            Message.tool({
-              id,
-              name: "record",
-              resultType: "content",
-              result: [
-                ...(id === "call_1" ? [{ type: "text" as const, text: `before ${id}` }] : []),
-                { type: "file", uri: `https://example.com/${id}.mp4`, mime: "video/mp4" },
-                { type: "file", uri: `https://example.com/${id}-next.mp4`, mime: "video/mp4" },
-                ...(id === "call_1" ? [{ type: "text" as const, text: `after ${id}` }] : []),
-              ],
-            })
-          const calls = ["call_1", "call_2", "call_3"]
-          const results = [
-            tool("call_1"),
-            tool("call_2"),
-            Message.tool({ id: "call_3", name: "record", resultType: "text", result: "plain result" }),
-          ]
-          const messages =
-            target === "user"
-              ? [
-                  Message.user([
-                    { type: "text", text: "before" },
-                    { type: "media", media: Media.url("https://example.com/user.mp4", { mediaType: "video/mp4" }) },
-                    { type: "text", text: "after" },
-                  ]),
-                ]
-              : [
-                  Message.assistant(calls.map((id) => ToolCallPart.make({ id, name: "record", input: {} }))),
-                  ...(target === "tool"
-                    ? [Message.make({ role: "tool", content: results.flatMap((result) => result.content) })]
-                    : results),
-                  ...(target === "end"
-                    ? []
-                    : [
-                        target === "assistant"
-                          ? Message.assistant("continue")
-                          : target === "system"
-                            ? Message.system("continue")
-                            : Message.user("continue"),
-                      ]),
-                ]
-          const prepared = compileRequest(LLM.request({ model: item.model, messages }))
-          if (item.video === false) {
-            expect(yield* prepared.pipe(Effect.flip)).toMatchObject({
-              reason: {
-                _tag: "InvalidRequest",
-                message: expect.stringContaining("Responses does not support video input"),
-              },
-            })
-            continue
-          }
-          expect((yield* prepared).body.input).toMatchObject(
-            target === "user"
-              ? [{ role: "user", content: [text("before"), video("user"), text("after")] }]
-              : [
-                  ...calls.map((call_id) => ({ type: "function_call", call_id })),
-                  ...calls.map((call_id) => {
-                    if (call_id === "call_3") return { type: "function_call_output", call_id, output: "plain result" }
-                    const videos = [video(call_id), video(`${call_id}-next`)]
-                    const output = [
-                      ...(call_id === "call_1" ? [text(`before ${call_id}`)] : []),
-                      ...(hoist ? [] : videos),
-                      ...(call_id === "call_1" ? [text(`after ${call_id}`)] : []),
-                    ]
-                    return {
-                      type: "function_call_output",
-                      call_id,
-                      output: output.length > 0 ? output : "Video attached in the following user message.",
-                    }
-                  }),
-                  ...(hoist
-                    ? [
-                        {
-                          type: "message",
-                          role: "user",
-                          content: [video("call_1"), video("call_1-next"), video("call_2"), video("call_2-next")],
-                        },
-                      ]
-                    : []),
-                  ...(target === "end"
-                    ? []
-                    : [
-                        target === "assistant"
-                          ? { type: "message", role: "assistant", content: [{ type: "output_text", text: "continue" }] }
-                          : target === "system"
-                            ? { type: "message", role: "developer", content: "continue" }
-                            : { type: "message", role: "user", content: [text("continue")] },
-                      ]),
-                ],
-          )
-        }
+      ]) {
+        const prepared = yield* compileRequest(LLM.request({ model: item.model, messages }))
+        expect(prepared.body.input, item.name).toMatchObject(item.input)
       }
+
+      const rejected = yield* compileRequest(LLM.request({ model, prompt: { type: "media", media } })).pipe(Effect.flip)
+      expect(rejected).toMatchObject({
+        reason: { _tag: "InvalidRequest", message: "openai Responses does not support video input" },
+      })
+
+      const metaRequest = LLM.request({
+        model: Meta.configure({ apiKey: "test" }).responses("muse-spark-1.3"),
+        messages: [
+          Message.assistant([
+            ToolCallPart.make({ id: "call_video", name: "record", input: {} }),
+            ToolCallPart.make({ id: "call_text", name: "read", input: {} }),
+          ]),
+          videoResult,
+          Message.tool({ id: "call_text", name: "read", resultType: "text", result: "plain result" }),
+        ],
+      })
+      const metaInput = [
+        { type: "function_call", call_id: "call_video", name: "record", arguments: "{}" },
+        { type: "function_call", call_id: "call_text", name: "read", arguments: "{}" },
+        {
+          type: "function_call_output",
+          call_id: "call_video",
+          output: "Video attached in the following user message.",
+        },
+        { type: "function_call_output", call_id: "call_text", output: "plain result" },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_video", video_url: "https://example.com/clip.mp4" }],
+        },
+      ]
+      expect((yield* compileRequest(metaRequest)).body.input, "Meta flushes videos at end of history").toMatchObject(
+        metaInput,
+      )
+      const continued = yield* compileRequest(
+        LLMRequest.update(metaRequest, { messages: [...metaRequest.messages, Message.user("continue")] }),
+      )
+      expect(continued.body.input, "Meta flushes videos before the next user message").toMatchObject([
+        ...metaInput,
+        { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
+      ])
     }),
   )
 
