@@ -235,7 +235,18 @@ export const { use: useEditorContext, provider: EditorContextProvider } = create
 
         const selection = message.method === "selection_changed" ? decodeEditorSelection(message.params) : Option.none()
         if (Option.isSome(selection)) {
-          setSelection({ ...selection.value, source: "websocket" })
+          // WebSocket bridges send 0-based LSP positions; the Zed source is 1-based.
+          setSelection({
+            ...selection.value,
+            source: "websocket",
+            ranges: selection.value.ranges.map((range) => ({
+              ...range,
+              selection: {
+                start: { ...range.selection.start, line: range.selection.start.line + 1 },
+                end: { ...range.selection.end, line: range.selection.end.line + 1 },
+              },
+            })),
+          })
           return
         }
 
