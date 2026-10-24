@@ -645,8 +645,14 @@ const lowerMessages = Effect.fnUntraced(function* (
   const input: OpenResponsesInputItem[] = []
   const providerMetadataKey = metadataKey(request.model)
   const provider = videoProvider(request)
+  const pendingVideos: Array<Schema.Schema.Type<typeof OpenResponsesInputVideo>> = []
+  const flushVideos = () => {
+    if (pendingVideos.length === 0) return
+    input.push({ type: "message", role: "user", content: pendingVideos.splice(0) })
+  }
 
   for (const message of request.messages) {
+    if (message.role !== "tool") flushVideos()
     const rawMetadata = message.providerMetadata?.[providerMetadataKey]
     const metadata = rawMetadata === undefined ? undefined : yield* decodeMessageMetadata(rawMetadata)
     if (message.role === "system") {
@@ -805,10 +811,11 @@ const lowerMessages = Effect.fnUntraced(function* (
             ? "Video attached in the following user message."
             : content,
       })
-      if (videos.length > 0) input.push({ type: "message", role: "user", content: videos })
+      pendingVideos.push(...videos)
     }
   }
 
+  flushVideos()
   return input
 })
 

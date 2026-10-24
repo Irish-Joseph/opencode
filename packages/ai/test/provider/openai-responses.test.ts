@@ -1906,7 +1906,12 @@ describe("OpenAI Responses route", () => {
           video: false,
         },
       ] as const) {
-        for (const target of ["user", "tool"] as const) {
+        const hoist = "hoist" in item && item.hoist
+        for (const target of [
+          "user",
+          "tool",
+          ...(hoist ? (["split-tool", "assistant", "system", "end"] as const) : []),
+        ] as const) {
           const video = (id: string) => ({
             type: item.video === "generic" ? (target === "user" ? "input_file" : "input_video") : item.video,
             ...(item.video === "input_file" || (item.video === "generic" && target === "user")
@@ -1926,6 +1931,12 @@ describe("OpenAI Responses route", () => {
                 ...(id === "call_1" ? [{ type: "text" as const, text: `after ${id}` }] : []),
               ],
             })
+          const calls = ["call_1", "call_2", "call_3"]
+          const results = [
+            tool("call_1"),
+            tool("call_2"),
+            Message.tool({ id: "call_3", name: "record", resultType: "text", result: "plain result" }),
+          ]
           const messages =
             target === "user"
               ? [
@@ -1936,11 +1947,19 @@ describe("OpenAI Responses route", () => {
                   ]),
                 ]
               : [
-                  Message.assistant(
-                    ["call_1", "call_2"].map((id) => ToolCallPart.make({ id, name: "record", input: {} })),
-                  ),
-                  Message.make({ role: "tool", content: [...tool("call_1").content, ...tool("call_2").content] }),
-                  Message.user("continue"),
+                  Message.assistant(calls.map((id) => ToolCallPart.make({ id, name: "record", input: {} }))),
+                  ...(target === "tool"
+                    ? [Message.make({ role: "tool", content: results.flatMap((result) => result.content) })]
+                    : results),
+                  ...(target === "end"
+                    ? []
+                    : [
+                        target === "assistant"
+                          ? Message.assistant("continue")
+                          : target === "system"
+                            ? Message.system("continue")
+                            : Message.user("continue"),
+                      ]),
                 ]
           const prepared = compileRequest(LLM.request({ model: item.model, messages }))
           if (item.video === false) {
@@ -1956,25 +1975,39 @@ describe("OpenAI Responses route", () => {
             target === "user"
               ? [{ role: "user", content: [text("before"), video("user"), text("after")] }]
               : [
-                  ...["call_1", "call_2"].map((call_id) => ({ type: "function_call", call_id })),
-                  ...["call_1", "call_2"].flatMap((call_id) => {
+                  ...calls.map((call_id) => ({ type: "function_call", call_id })),
+                  ...calls.map((call_id) => {
+                    if (call_id === "call_3") return { type: "function_call_output", call_id, output: "plain result" }
                     const videos = [video(call_id), video(`${call_id}-next`)]
-                    const hoist = "hoist" in item && item.hoist
                     const output = [
                       ...(call_id === "call_1" ? [text(`before ${call_id}`)] : []),
                       ...(hoist ? [] : videos),
                       ...(call_id === "call_1" ? [text(`after ${call_id}`)] : []),
                     ]
-                    return [
-                      {
-                        type: "function_call_output",
-                        call_id,
-                        output: output.length > 0 ? output : "Video attached in the following user message.",
-                      },
-                      ...(hoist ? [{ type: "message", role: "user", content: videos }] : []),
-                    ]
+                    return {
+                      type: "function_call_output",
+                      call_id,
+                      output: output.length > 0 ? output : "Video attached in the following user message.",
+                    }
                   }),
-                  { type: "message", role: "user", content: [text("continue")] },
+                  ...(hoist
+                    ? [
+                        {
+                          type: "message",
+                          role: "user",
+                          content: [video("call_1"), video("call_1-next"), video("call_2"), video("call_2-next")],
+                        },
+                      ]
+                    : []),
+                  ...(target === "end"
+                    ? []
+                    : [
+                        target === "assistant"
+                          ? { type: "message", role: "assistant", content: [{ type: "output_text", text: "continue" }] }
+                          : target === "system"
+                            ? { type: "message", role: "developer", content: "continue" }
+                            : { type: "message", role: "user", content: [text("continue")] },
+                      ]),
                 ],
           )
         }
