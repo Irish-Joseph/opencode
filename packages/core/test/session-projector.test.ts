@@ -24,14 +24,37 @@ import { fromRow } from "@opencode/core/session/info"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionStore } from "@opencode/core/session/store"
 import { Shell } from "@opencode/schema/shell"
-import { InstructionStateTable, SessionInboxTable, SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
+import {
+  InstructionStateTable,
+  MediaBlobTable,
+  MediaRefTable,
+  SessionInboxTable,
+  SessionMessageTable,
+  SessionTable,
+} from "@opencode/core/session/sql"
+import { Image } from "@opencode/core/image"
+import { SessionMediaBlob } from "@opencode/core/session/media-blob"
+import { SessionTransfer } from "@opencode/core/session/transfer"
+import { Database as SqliteDatabase } from "bun:sqlite"
+import fs from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
+import { migrateMediaBlobs } from "../script/migrate-media-blobs"
 import { testEffect } from "./lib/effect"
 import { Snapshot } from "@opencode/core/snapshot"
 
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([Database.node, Bus.node, SessionProjector.node, SessionInbox.node, SessionStore.node]),
-    [Bus.node.replace(Bus.configured({ persist: true }))],
+    LayerNode.group([
+      Database.node,
+      Bus.node,
+      SessionProjector.node,
+      SessionInbox.node,
+      SessionStore.node,
+      Image.node,
+      SessionTransfer.node,
+    ]),
+    [Bus.node.replace(Bus.configured({ persist: true })), SessionExecution.node.replace(SessionExecution.noopLayer)],
   ),
 )
 const sessionsLayer = AppNodeBuilder.build(Session.node, [SessionExecution.node.replace(SessionExecution.noopLayer)])
@@ -991,6 +1014,564 @@ describe("SessionProjector", () => {
         error: { type: "provider.invalid-request", message: "Failed" },
       })
       expect(yield* updated()).toEqual({ time_updated: 15 })
+    }),
+  )
+
+  it.effect("gates media_blob ref writes behind experimental.mediaBlob (default off) while always hydrating reads", () =>
+    Effect.gen(function* () {
+      const db = yield* seedSession()
+      const bus = yield* Bus.Service
+      const inbox = yield* SessionInbox.Service
+      const store = yield* SessionStore.Service
+
+      const rawBytes = Buffer.from("default-off-inline-payload")
+      const base64 = rawBytes.toString("base64")
+      const inlineID = SessionMessage.ID.make("msg_default_inline")
+      const file = {
+        data: base64,
+        mime: "application/pdf",
+        source: { type: "inline" as const },
+        name: "inline.pdf",
+      }
+
+      // Default (experimental.mediaBlob off): writes stay inline and media_blob/media_ref stay empty.
+      yield* inbox.admit({
+        id: inlineID,
+        sessionID,
+        item: { type: "user", payload: { text: "keep inline", files: [file] }, delivery: "steer" },
+      })
+      yield* bus.publish(SessionEvent.InboxDelivered, { sessionID, inboxID: inlineID })
+
+      expect(yield* db.select().from(MediaBlobTable).all().pipe(Effect.orDie)).toHaveLength(0)
+      expect(yield* db.select().from(MediaRefTable).all().pipe(Effect.orDie)).toHaveLength(0)
+      const rawInlineRow = yield* db
+        .select()
+        .from(SessionMessageTable)
+        .where(eq(SessionMessageTable.id, inlineID))
+        .get()
+        .pipe(Effect.orDie)
+      expect(JSON.stringify(rawInlineRow?.data)).toContain(base64)
+
+      // When experimental.mediaBlob is enabled, writes externalize and deduplicate into media_blob + media_ref.
+      const userID = SessionMessage.ID.make("msg_user_media_blob")
+      const item = {
+        type: "user" as const,
+        payload: { text: "check these", files: [file, { ...file, name: "spec-copy.pdf" }] },
+        delivery: "steer" as const,
+      }
+
+      const admitted = yield* inbox
+        .admit({ id: userID, sessionID, item })
+        .pipe(SessionMediaBlob.withWriteEnabled(true))
+      expect(admitted?.payload.files).toEqual([file, { ...file, name: "spec-copy.pdf" }])
+
+      const rawInbox = yield* db
+        .select()
+        .from(SessionInboxTable)
+        .where(eq(SessionInboxTable.id, userID))
+        .get()
+        .pipe(Effect.orDie)
+      expect(JSON.stringify(rawInbox?.payload)).not.toContain(base64)
+      expect(JSON.stringify(rawInbox?.payload)).toContain("/api/media/")
+
+      // Promotion preserves externalized refs even when WriteEnabled is not set on the delivery fiber.
+      yield* bus.publish(SessionEvent.InboxDelivered, { sessionID, inboxID: userID })
+
+      const assistantMessageID = SessionMessage.ID.make("msg_assistant_media_blob")
+      const dataUri = `data:application/pdf;base64,${base64}`
+      yield* Effect.gen(function* () {
+        yield* bus.publish(SessionEvent.Step.Started, {
+          sessionID,
+          assistantMessageID,
+          agent: build,
+          model,
+          started: 1,
+        })
+        yield* bus.publish(SessionEvent.Tool.Input.Started, {
+          sessionID,
+          assistantMessageID,
+          id: "call_media_1",
+          name: "read",
+        })
+        yield* bus.publish(SessionEvent.Tool.Called, {
+          sessionID,
+          assistantMessageID,
+          id: "call_media_1",
+          input: { path: "spec.pdf" },
+          executed: false,
+        })
+        yield* bus.publish(SessionEvent.Tool.Success, {
+          sessionID,
+          assistantMessageID,
+          id: "call_media_1",
+          executed: false,
+          content: [
+            { type: "text", text: "PDF read" },
+            { type: "file", uri: dataUri, mime: "application/pdf", name: "spec.pdf" },
+            { type: "file", uri: dataUri, mime: "application/pdf", name: "spec-2.pdf" },
+          ],
+        })
+      }).pipe(SessionMediaBlob.withWriteEnabled(true))
+
+      const blobs = yield* db.select().from(MediaBlobTable).all().pipe(Effect.orDie)
+      expect(blobs).toHaveLength(1)
+      expect(blobs[0]?.mime).toBe("application/pdf")
+      expect(blobs[0]?.bytes).toBe(rawBytes.byteLength)
+      expect(blobs[0]?.width).toBeNull()
+      expect(blobs[0]?.height).toBeNull()
+      expect(Buffer.from(blobs[0]!.data).equals(rawBytes)).toBe(true)
+
+      const refs = yield* db.select().from(MediaRefTable).all().pipe(Effect.orDie)
+      expect(refs).toHaveLength(2)
+
+      // Hydrate-on-read works even when experimental.mediaBlob is off.
+      expect((yield* store.message(userID))?.message).toMatchObject({
+        id: userID,
+        type: "user",
+        files: [file, { ...file, name: "spec-copy.pdf" }],
+      })
+    }),
+  )
+
+  it.effect("garbage-collects media_ref and media_blob across cancel, revert, fork, and session delete", () =>
+    Effect.gen(function* () {
+      const db = yield* seedSession()
+      const bus = yield* Bus.Service
+      const inbox = yield* SessionInbox.Service
+
+      const makeFile = (label: string) => ({
+        data: Buffer.from(`media-gc-${label}`).toString("base64"),
+        mime: "application/pdf",
+        source: { type: "inline" as const },
+        name: `${label}.pdf`,
+      })
+
+      const msg1 = SessionMessage.ID.make("msg_gc_1")
+      const msg2 = SessionMessage.ID.make("msg_gc_2")
+      const cancelledID = SessionMessage.ID.make("msg_gc_cancel")
+
+      yield* Effect.gen(function* () {
+        yield* inbox.admit({
+          id: msg1,
+          sessionID,
+          item: { type: "user", payload: { text: "first", files: [makeFile("first")] }, delivery: "steer" },
+        })
+        yield* bus.publish(SessionEvent.InboxDelivered, { sessionID, inboxID: msg1 })
+
+        yield* inbox.admit({
+          id: msg2,
+          sessionID,
+          item: { type: "user", payload: { text: "second", files: [makeFile("second")] }, delivery: "steer" },
+        })
+        yield* bus.publish(SessionEvent.InboxDelivered, { sessionID, inboxID: msg2 })
+
+        yield* inbox.admit({
+          id: cancelledID,
+          sessionID,
+          item: { type: "user", payload: { text: "cancelled", files: [makeFile("cancelled")] }, delivery: "queue" },
+        })
+      }).pipe(SessionMediaBlob.withWriteEnabled(true))
+
+      expect(yield* db.select().from(MediaBlobTable).all().pipe(Effect.orDie)).toHaveLength(3)
+      expect(yield* db.select().from(MediaRefTable).all().pipe(Effect.orDie)).toHaveLength(3)
+
+      // 1. Cancelling a queued inbox item removes its ref and sweeps its blob.
+      yield* inbox.cancel({ id: cancelledID, sessionID })
+      expect(yield* db.select().from(MediaBlobTable).all().pipe(Effect.orDie)).toHaveLength(2)
+      expect(yield* db.select().from(MediaRefTable).all().pipe(Effect.orDie)).toHaveLength(2)
+
+      // 2. Forking through msg1 records a media_ref for the child session on the first blob.
+      const childSessionID = Session.ID.make("ses_gc_fork_child")
+      yield* bus.publish(SessionEvent.Forked, {
+        sessionID: childSessionID,
+        parentID: sessionID,
+        boundary: { type: "through", messageID: msg1 },
+      })
+      expect(yield* db.select().from(MediaRefTable).all().pipe(Effect.orDie)).toHaveLength(3)
+
+      // 3. Reverting the parent session at msg2 drops msg2's ref and sweeps the second blob.
+      yield* bus.publish(SessionEvent.RevertEvent.Committed, {
+        sessionID,
+        to: msg2,
+      })
+      expect(yield* db.select().from(MediaBlobTable).all().pipe(Effect.orDie)).toHaveLength(1)
+      expect(yield* db.select().from(MediaRefTable).all().pipe(Effect.orDie)).toHaveLength(2)
+
+      // 4. Deleting the parent session removes its ref, but the shared blob survives for the fork child.
+      yield* bus.publish(SessionEvent.Deleted, { sessionID })
+      expect(yield* db.select().from(MediaBlobTable).all().pipe(Effect.orDie)).toHaveLength(1)
+      expect(yield* db.select().from(MediaRefTable).all().pipe(Effect.orDie)).toHaveLength(1)
+
+      // 5. Deleting the fork child removes the last ref and sweeps the remaining blob.
+      yield* bus.publish(SessionEvent.Deleted, { sessionID: childSessionID })
+      expect(yield* db.select().from(MediaBlobTable).all().pipe(Effect.orDie)).toHaveLength(0)
+      expect(yield* db.select().from(MediaRefTable).all().pipe(Effect.orDie)).toHaveLength(0)
+    }),
+  )
+
+  it.effect("proves byte-identical toEqual output across message.list, inbox.list, and export (including >2000px and PNG->JPEG)", () =>
+    Effect.gen(function* () {
+      yield* seedSession({ time_created: 0, time_updated: 0 })
+      const bus = yield* Bus.Service
+      const inbox = yield* SessionInbox.Service
+      const store = yield* SessionStore.Service
+      const transfer = yield* SessionTransfer.Service
+      const image = yield* Image.Service
+      const db = (yield* Database.Service).db
+
+      const photon = yield* Effect.promise(() => import("@silvia-odwyer/photon-node"))
+
+      // 1) Image larger than 2000px (2400x1200) -> normalized by Image.Service before persistence.
+      const overW = 2400
+      const overH = 1200
+      const overPixels = new Uint8Array(overW * overH * 4)
+      overPixels.fill(210)
+      const overImg = new photon.PhotonImage(overPixels, overW, overH)
+      const rawOversizedBase64 = Buffer.from(overImg.get_bytes()).toString("base64")
+      overImg.free()
+
+      // 2) Opaque PNG >384KB base64 -> converted to image/jpeg by Image.Service before persistence.
+      const opaqueW = 640
+      const opaqueH = 640
+      const opaquePixels = new Uint8Array(opaqueW * opaqueH * 4)
+      for (let i = 0; i < opaquePixels.length; i += 4) {
+        const px = i >>> 2
+        opaquePixels[i] = ((px * 73) ^ (px >>> 3)) & 0xff
+        opaquePixels[i + 1] = ((px * 151) ^ (px >>> 5)) & 0xff
+        opaquePixels[i + 2] = ((px * 211) ^ (px >>> 7)) & 0xff
+        opaquePixels[i + 3] = 255
+      }
+      const opaqueImg = new photon.PhotonImage(opaquePixels, opaqueW, opaqueH)
+      const rawOpaquePngBase64 = Buffer.from(opaqueImg.get_bytes()).toString("base64")
+      opaqueImg.free()
+
+      const normOversized = yield* image.normalize("huge.png", {
+        uri: "huge.png",
+        content: rawOversizedBase64,
+        encoding: "base64",
+        mime: "image/png",
+      })
+      const normOpaque = yield* image.normalize("photo.png", {
+        uri: "photo.png",
+        content: rawOpaquePngBase64,
+        encoding: "base64",
+        mime: "image/png",
+      })
+      expect(normOpaque.mime).toBe("image/jpeg")
+
+      const populateSession = (targetSessionID: Session.ID, prefix: string) =>
+        Effect.gen(function* () {
+          if (targetSessionID !== sessionID) {
+            yield* bus.publish(SessionEvent.Created, {
+              sessionID: targetSessionID,
+              slug: prefix,
+              version: "test",
+              projectID: Project.ID.global,
+              location: { directory: AbsolutePath.make("/project") },
+              subpath: RelativePath.make(""),
+              title: "test",
+            })
+          }
+          const userID = SessionMessage.ID.make(`msg_${prefix}_user`)
+          const assistantID = SessionMessage.ID.make(`msg_${prefix}_assistant`)
+          const queuedID = SessionMessage.ID.make(`msg_${prefix}_queued`)
+
+          yield* inbox.admit({
+            id: userID,
+            sessionID: targetSessionID,
+            item: {
+              type: "user",
+              payload: {
+                text: "normalized images",
+                files: [
+                  {
+                    data: normOversized.content,
+                    mime: normOversized.mime,
+                    source: { type: "inline" },
+                    name: "huge.png",
+                  },
+                  {
+                    data: normOpaque.content,
+                    mime: normOpaque.mime,
+                    source: { type: "uri", uri: "file:///project/photo.png" },
+                    name: "photo.png",
+                  },
+                ],
+              },
+              delivery: "steer",
+            },
+          })
+          yield* bus.publish(SessionEvent.InboxDelivered, { sessionID: targetSessionID, inboxID: userID })
+
+          yield* bus.publish(SessionEvent.Step.Started, {
+            sessionID: targetSessionID,
+            assistantMessageID: assistantID,
+            agent: build,
+            model,
+            started: 10,
+          })
+          yield* bus.publish(SessionEvent.Tool.Input.Started, {
+            sessionID: targetSessionID,
+            assistantMessageID: assistantID,
+            id: "call_img",
+            name: "read",
+          })
+          yield* bus.publish(SessionEvent.Tool.Called, {
+            sessionID: targetSessionID,
+            assistantMessageID: assistantID,
+            id: "call_img",
+            input: { path: "photo.png" },
+            executed: false,
+          })
+          yield* bus.publish(SessionEvent.Tool.Success, {
+            sessionID: targetSessionID,
+            assistantMessageID: assistantID,
+            id: "call_img",
+            executed: false,
+            content: [
+              { type: "text", text: "Image read successfully" },
+              {
+                type: "file",
+                uri: `data:${normOpaque.mime};base64,${normOpaque.content}`,
+                mime: normOpaque.mime,
+                name: "photo.png",
+              },
+            ],
+          })
+          yield* bus.publish(SessionEvent.Step.Ended, {
+            sessionID: targetSessionID,
+            assistantMessageID: assistantID,
+            finish: "stop",
+            cost: Money.USD.make(0),
+            tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+          })
+
+          yield* inbox.admit({
+            id: queuedID,
+            sessionID: targetSessionID,
+            item: {
+              type: "user",
+              payload: {
+                text: "queued follow-up",
+                files: [
+                  {
+                    data: normOversized.content,
+                    mime: normOversized.mime,
+                    source: { type: "inline" },
+                    name: "queued-huge.png",
+                  },
+                ],
+              },
+              delivery: "queue",
+            },
+          })
+        })
+
+      // Session 1: stored inline (experimental.mediaBlob off)
+      yield* TestClock.setTime(100)
+      yield* populateSession(sessionID, "compare")
+      const inlineMessages = yield* store.messages({ sessionID, order: "asc" })
+      const inlineInbox = yield* inbox.list(sessionID)
+      const inlineExport = yield* transfer.export({ sessionID })
+
+      expect(yield* db.select().from(MediaBlobTable).all().pipe(Effect.orDie)).toHaveLength(0)
+
+      // Clear Session 1 and run the exact same sequence with experimental.mediaBlob enabled
+      yield* bus.publish(SessionEvent.Deleted, { sessionID })
+      yield* db.delete(EventTable).run().pipe(Effect.orDie)
+      yield* db.run(sql`DELETE FROM event_sequence`).pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: Project.ID.global,
+          slug: "test",
+          directory: "/project",
+          title: "test",
+          version: "test",
+          time_created: 0,
+          time_updated: 0,
+        })
+        .run()
+        .pipe(Effect.orDie)
+      yield* TestClock.setTime(100)
+      yield* populateSession(sessionID, "compare").pipe(SessionMediaBlob.withWriteEnabled(true))
+
+      const blobs = yield* db.select().from(MediaBlobTable).all().pipe(Effect.orDie)
+      expect(blobs).toHaveLength(2)
+      const byWidth = new Map(blobs.map((blob) => [blob.width, blob]))
+      expect(byWidth.get(2000)?.height).toBe(1000)
+      expect(byWidth.get(640)?.height).toBe(640)
+      expect(byWidth.get(640)?.mime).toBe("image/jpeg")
+
+      const refMessages = yield* store.messages({ sessionID, order: "asc" })
+      const refInbox = yield* inbox.list(sessionID)
+      const refExport = yield* transfer.export({ sessionID })
+
+      expect(refMessages).toEqual(inlineMessages)
+      expect(refInbox).toEqual(inlineInbox)
+      expect(refExport).toEqual(inlineExport)
+      expect(JSON.parse(JSON.stringify(refMessages))).toEqual(JSON.parse(JSON.stringify(inlineMessages)))
+      expect(JSON.parse(JSON.stringify(refInbox))).toEqual(JSON.parse(JSON.stringify(inlineInbox)))
+      expect(JSON.parse(JSON.stringify(refExport))).toEqual(JSON.parse(JSON.stringify(inlineExport)))
+    }),
+  )
+
+  it.effect("backfills legacy inline rows idempotently, populates media_ref, batches safely, and fails fast when locked", () =>
+    Effect.gen(function* () {
+      const tmpDir = yield* Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "opencode-media-backfill-")))
+      const dbPath = path.join(tmpDir, "test.db")
+      const sqlite = new SqliteDatabase(dbPath)
+      try {
+        sqlite.exec(`
+          PRAGMA journal_mode = WAL;
+          CREATE TABLE session_v2 (
+            id text PRIMARY KEY
+          );
+          CREATE TABLE session_message (
+            id text PRIMARY KEY,
+            session_id text NOT NULL,
+            type text NOT NULL,
+            seq integer NOT NULL,
+            time_created integer NOT NULL,
+            time_updated integer NOT NULL,
+            data text NOT NULL
+          );
+          CREATE TABLE session_inbox (
+            id text PRIMARY KEY,
+            session_id text NOT NULL,
+            type text NOT NULL,
+            payload text NOT NULL,
+            delivery text NOT NULL,
+            enqueued_seq integer NOT NULL,
+            time_created integer NOT NULL
+          );
+          INSERT INTO session_v2 VALUES ('ses_1');
+        `)
+
+        const photon = yield* Effect.promise(() => import("@silvia-odwyer/photon-node"))
+        const pixels = new Uint8Array(2200 * 1100 * 4)
+        pixels.fill(180)
+        const img = new photon.PhotonImage(pixels, 2200, 1100)
+        const oversizedBase64 = Buffer.from(img.get_bytes()).toString("base64")
+        img.free()
+
+        const raw = Buffer.from("legacy-inline-attachment-bytes")
+        const base64 = raw.toString("base64")
+        const userRow = {
+          text: "legacy user",
+          files: [
+            { data: base64, mime: "application/pdf", source: { type: "inline" }, name: "legacy.pdf" },
+            { data: oversizedBase64, mime: "image/png", source: { type: "inline" }, name: "legacy-huge.png" },
+          ],
+          time: { created: 0 },
+        }
+        const assistantRowData = {
+          agent: "build",
+          model: { id: "model", providerID: "provider" },
+          content: [
+            {
+              type: "tool",
+              id: "call_1",
+              name: "read",
+              executed: true,
+              state: {
+                status: "completed",
+                input: {},
+                content: [{ type: "file", uri: `data:application/pdf;base64,${base64}`, mime: "application/pdf" }],
+              },
+              time: { created: 0, ran: 0, completed: 0 },
+            },
+          ],
+          time: { created: 0 },
+        }
+        sqlite
+          .query(`INSERT INTO session_message VALUES (?, 'ses_1', 'user', 1, 0, 0, ?)`)
+          .run("msg_1", JSON.stringify(userRow))
+        sqlite
+          .query(`INSERT INTO session_message VALUES (?, 'ses_1', 'assistant', 2, 0, 0, ?)`)
+          .run("msg_2", JSON.stringify(assistantRowData))
+        sqlite
+          .query(`INSERT INTO session_inbox VALUES (?, 'ses_1', 'user', ?, 'steer', 3, 0)`)
+          .run("inb_1", JSON.stringify(userRow))
+
+        const first = yield* Effect.promise(() =>
+          migrateMediaBlobs(sqlite, { now: 123, maxBatchRows: 1 }),
+        )
+        expect(first.migratedRows).toBe(3)
+        expect(first.blobsStored).toBe(2)
+        expect(first.refsRecorded).toBe(5)
+
+        const storedBlobs = sqlite
+          .query<{ hash: string; mime: string; bytes: number; width: number | null; height: number | null }, []>(
+            `SELECT hash, mime, bytes, width, height FROM media_blob`,
+          )
+          .all()
+        expect(storedBlobs).toHaveLength(2)
+        const imageBlob = storedBlobs.find((b) => b.width !== null)
+        expect(imageBlob?.width).toBe(2000)
+        expect(imageBlob?.height).toBe(1000)
+
+        const storedRefs = sqlite
+          .query<{ session_id: string; message_id: string; hash: string; seq: number }, []>(
+            `SELECT session_id, message_id, hash, seq FROM media_ref ORDER BY seq ASC`,
+          )
+          .all()
+        expect(storedRefs).toHaveLength(5)
+        expect(storedRefs.map((r) => [r.message_id, r.seq])).toEqual([
+          ["msg_1", 1],
+          ["msg_1", 1],
+          ["msg_2", 2],
+          ["inb_1", 3],
+          ["inb_1", 3],
+        ])
+
+        const second = yield* Effect.promise(() => migrateMediaBlobs(sqlite, { now: 456 }))
+        expect(second.migratedRows).toBe(0)
+        expect(second.skippedChanged).toBe(0)
+        expect(second.blobsStored).toBe(0)
+
+        // If a row changes between the unlocked read and the batch transaction, skip it and count it instead of overwriting
+        sqlite
+          .query(`INSERT INTO session_message VALUES ('msg_race', 'ses_1', 'user', 4, 0, 0, ?)`)
+          .run(JSON.stringify(userRow))
+        const raced = yield* Effect.promise(() =>
+          migrateMediaBlobs(sqlite, {
+            onBeforeBatchCommit: (ids) => {
+              if (ids.includes("msg_race")) {
+                sqlite
+                  .query(`UPDATE session_message SET data = ? WHERE id = 'msg_race'`)
+                  .run(JSON.stringify({ ...userRow, text: "concurrently updated" }))
+              }
+            },
+          }),
+        )
+        expect(raced.skippedChanged).toBe(1)
+        const racedRow = sqlite
+          .query<{ data: string }, []>(`SELECT data FROM session_message WHERE id = 'msg_race'`)
+          .get()
+        expect(JSON.parse(racedRow!.data).text).toBe("concurrently updated")
+        expect(JSON.parse(racedRow!.data).files[0].data).toBe(base64)
+
+        // Fail fast if another connection holds a BEGIN IMMEDIATE write lock
+        const locker = new SqliteDatabase(dbPath)
+        try {
+          locker.exec("BEGIN IMMEDIATE;")
+          const lockError = yield* Effect.promise(() =>
+            migrateMediaBlobs(sqlite, { busyTimeoutMs: 25 }).then(
+              () => undefined,
+              (err: unknown) => err,
+            ),
+          )
+          expect(lockError).toBeInstanceOf(Error)
+          expect(String(lockError)).toContain("locked")
+        } finally {
+          locker.close()
+        }
+      } finally {
+        sqlite.close()
+        yield* Effect.promise(() => fs.rm(tmpDir, { recursive: true, force: true }))
+      }
     }),
   )
 })
